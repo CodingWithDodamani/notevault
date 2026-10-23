@@ -1,0 +1,8 @@
+{
+  "name": "Remix NoteVault Cloud",
+  "description": "Personal cloud study notes vault connected to Google Drive for PDFs, DOCX, and Samsung Notes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
