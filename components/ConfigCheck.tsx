@@ -17,22 +17,42 @@ interface ConfigCheckProps {
   originOverride?: string;
 }
 
+const DISMISS_KEY = 'notevault:config-check-dismissed';
+
 export function ConfigCheck({ originOverride }: ConfigCheckProps = {}) {
   const [dismissed, setDismissed] = useState(false);
+  const [mounted, setMounted] = useState(false);
+
+  React.useEffect(() => {
+    const t = setTimeout(() => {
+      setMounted(true);
+      if (localStorage.getItem(DISMISS_KEY) === '1') setDismissed(true);
+    }, 0);
+    return () => clearTimeout(t);
+  }, []);
+
+  const dismiss = () => {
+    setDismissed(true);
+    localStorage.setItem(DISMISS_KEY, '1');
+  };
 
   const hostname =
     typeof window !== 'undefined'
       ? originOverride || window.location.hostname
       : originOverride || 'localhost';
   const isLocal = hostname === 'localhost' || hostname === '127.0.0.1';
+
+  // Skip on localhost — Firebase auto-authorizes localhost for development
+  if (isLocal) return null;
+
   const isVercel = hostname.includes('vercel.app');
   const isNetlify = hostname.includes('netlify.app');
   const platform = isVercel ? 'Vercel' : isNetlify ? 'Netlify' : 'custom';
 
   const consoleHost =
-    typeof window !== 'undefined' ? window.location.host : 'localhost:3000';
-  const protocol = isLocal ? 'http' : 'https';
-  const origin = `${protocol}//${consoleHost}`;
+    typeof window !== 'undefined' ? window.location.host : hostname;
+  const origin =
+    typeof window !== 'undefined' ? window.location.origin : `https://${consoleHost}`;
 
   const platformSetupLinks = isVercel
     ? [
@@ -52,7 +72,7 @@ export function ConfigCheck({ originOverride }: ConfigCheckProps = {}) {
         ]
       : [];
 
-  if (dismissed) return null;
+  if (dismissed || !mounted) return null;
 
   return (
     <div
@@ -109,12 +129,12 @@ export function ConfigCheck({ originOverride }: ConfigCheckProps = {}) {
           <strong>3. Environment variable (Vercel/Netlify):</strong>
           <ul className="list-disc list-inside mt-1 space-y-0.5 text-xs">
             <li>
-              Set <code className="font-mono">APP_URL={origin}</code> in your platform&apos;s Environment Variables.
+              Set <code className="font-mono">NEXT_PUBLIC_APP_URL={origin}</code> in your platform&apos;s Environment Variables.
             </li>
           </ul>
         </div>
         <button
-          onClick={() => setDismissed(true)}
+          onClick={dismiss}
           className="ml-auto p-1 rounded text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-800/50"
           aria-label="Dismiss setup banner"
         >
