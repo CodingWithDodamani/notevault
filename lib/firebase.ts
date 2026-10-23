@@ -2,6 +2,8 @@ import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
   getAuth,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   GoogleAuthProvider,
   onAuthStateChanged,
   signOut,
@@ -76,6 +78,57 @@ export const googleSignIn = async (): Promise<{
     return { user: result.user, accessToken: cachedAccessToken, refreshToken: cachedRefreshToken };
   } catch (error: unknown) {
     console.error('Google Sign-In error:', error);
+    throw error;
+  } finally {
+    isSigningIn = false;
+  }
+};
+
+/**
+ * Starts a full-page Google sign-in redirect. The browser navigates to
+ * Google and returns to the current URL afterwards; call
+ * `completeGoogleRedirect()` once after the page reloads.
+ * Used by the `/?connect=drive` direct link and as a popup-blocked fallback.
+ */
+export const googleSignInRedirect = async (): Promise<void> => {
+  isSigningIn = true;
+  try {
+    await signInWithRedirect(auth, provider);
+  } finally {
+    isSigningIn = false;
+  }
+};
+
+/**
+ * Completes a pending redirect sign-in (call once on app load).
+ * Returns null when no redirect result is waiting for this tab, otherwise
+ * caches the tokens in the same module-level store that `googleSignIn` uses.
+ */
+export const completeGoogleRedirect = async (): Promise<{
+  user: User;
+  accessToken: string;
+  refreshToken: string | null;
+} | null> => {
+  try {
+    const result = await getRedirectResult(auth);
+    if (!result?.user) {
+      return null;
+    }
+    const credential = GoogleAuthProvider.credentialFromResult(result);
+    if (!credential?.accessToken) {
+      return null;
+    }
+    const googleCredential = credential as typeof credential & { refreshToken?: string };
+    const refreshToken = googleCredential.refreshToken ?? null;
+    cachedAccessToken = credential.accessToken;
+    cachedRefreshToken = refreshToken;
+    return {
+      user: result.user,
+      accessToken: credential.accessToken,
+      refreshToken,
+    };
+  } catch (error) {
+    console.error('Google redirect sign-in error:', error);
     throw error;
   } finally {
     isSigningIn = false;

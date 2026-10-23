@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   X,
   Cloud,
@@ -12,13 +12,21 @@ import {
   RotateCw,
   Trash2,
 } from 'lucide-react';
-import { googleSignIn, logout, getAccessToken } from '@/lib/firebase';
+import { googleSignIn, googleSignInRedirect, logout, getAccessToken } from '@/lib/firebase';
 import { VaultFile, VaultFolder } from '@/lib/types';
 import { DriveSyncInfo } from '@/lib/vault-store';
 import { apiFetch, readApiError } from '@/lib/api-client';
 import { storeRefreshToken } from '@/lib/drive-session';
 import { useToast } from '@/lib/use-toast';
 import { Dialog } from '@/components/Dialog';
+
+/** Result of a completed /?connect=drive full-page redirect sign-in. */
+export interface PendingDriveConnect {
+  accessToken: string;
+  refreshToken: string | null;
+  email: string | null;
+  name: string | null;
+}
 
 interface DriveSyncModalProps {
   isOpen: boolean;
@@ -27,6 +35,9 @@ interface DriveSyncModalProps {
   onUpdateSyncInfo: (info: DriveSyncInfo | ((prev: DriveSyncInfo) => DriveSyncInfo)) => void;
   onAddFiles: (files: VaultFile[], folders?: VaultFolder[], replaceAll?: boolean) => void;
   onClearVault: () => void;
+  pendingConnect?: PendingDriveConnect | null;
+  pendingConnectError?: string | null;
+  onPendingConnectHandled?: () => void;
 }
 
 export function DriveSyncModal({
@@ -36,6 +47,9 @@ export function DriveSyncModal({
   onUpdateSyncInfo,
   onAddFiles,
   onClearVault,
+  pendingConnect,
+  pendingConnectError,
+  onPendingConnectHandled,
 }: DriveSyncModalProps) {
   const [isSigningIn, setIsSigningIn] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
@@ -49,6 +63,11 @@ export function DriveSyncModal({
   } | null>(null);
   const [isConfirmingClear, setIsConfirmingClear] = useState(false);
   const { toast } = useToast();
+
+  // Identity guards so a pending redirect result is consumed exactly once,
+  // even if the modal re-renders before the parent clears the pending state.
+  const handledConnectRef = useRef<PendingDriveConnect | null>(null);
+  const handledErrorRef = useRef<string | null>(null);
 
     const executeScan = async (tokenOverride?: string, forceFullScan = false) => {
     setIsScanning(true);
@@ -162,6 +181,80 @@ export function DriveSyncModal({
     }
   };
 
+  // Complete a /?connect=drive full-page redirect once the modal opens:
+  // mark connected, persist the refresh token, then auto-scan Drive.
+  useEffect(() => {
+    if (!isOpen) return;
+
+    if (pendingConnect && handledConnectRef.current !== pendingConnect) {
+      handledConnectRef.current = pendingConnect;
+      onPendingConnectHandled?.();
+      const { accessToken, refreshToken, email, name } = pendingConnect;
+
+      onUpdateSyncInfo((prev) => ({
+        ...prev,
+        isConnected: true,
+        userEmail: email,
+        userName: name,
+        lastSyncedAt: new Date().toISOString(),
+        isSyncing: false,
+      }));
+
+      toast({
+        title: 'Google Drive connected',
+        description: email
+          ? `Signed in as ${email}. Scanning your Drive…`
+          : 'Signed in. Scanning your Drive…',
+      });
+
+      if (refreshToken) {
+        void storeRefreshToken(refreshToken).then((stored) => {
+          if (!stored) {
+            toast({
+              title: 'Auto-reconnect unavailable',
+              description:
+                'Drive session storage is unavailable — you will need to sign in again after reloading this page.',
+            });
+          }
+        });
+      }
+
+      void executeScan(accessToken);
+      return;
+    }
+
+    if (pendingConnectError && handledErrorRef.current !== pendingConnectError) {
+      handledErrorRef.current = pendingConnectError;
+      onPendingConnectHandled?.();
+      const isUnauthorizedDomain = /unauthorized-domain/.test(pendingConnectError);
+      const hostname = typeof window !== 'undefined' ? window.location.hostname : '';
+      toast({
+        title: 'Sign-in failed',
+        description: isUnauthorizedDomain
+          ? `Add "${hostname}" to your Firebase project’s Authorized domains (Authentication → Settings → Authorized domains), then reopen the link.`
+          : pendingConnectError,
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, pendingConnect, pendingConnectError]);
+
+  const showSignInError = (err: unknown) => {
+    const message = err instanceof Error ? err.message : '';
+    const isUnauthorizedDomain = /unauthorized-domain/.test(message);
+
+    const hostname = typeof window !== 'undefined' ? window.location.hostname : '';
+    const isLocal = hostname === 'localhost' || hostname === '127.0.0.1';
+    const origin = typeof window !== 'undefined' ? window.location.origin : '';
+
+    toast({
+      title: 'Sign-in failed',
+      description:
+        isUnauthorizedDomain
+          ? `Add "${hostname}" to your Firebase project’s Authorized domains (Authentication → Settings → Authorized domains), then reload and try again.`
+          : `Could not complete Google Sign-In. ${isLocal ? 'Check your popup settings.' : `If you're on Vercel/Netlify, also add "${origin}" to your Google Cloud Console OAuth client (Authorized JavaScript origins + redirect URIs).`}`,
+    });
+  };
+
   const handleConnectGoogle = async () => {
     setIsSigningIn(true);
     try {
@@ -194,20 +287,25 @@ export function DriveSyncModal({
       }
     } catch (err: unknown) {
       console.error('Google sign in error:', err);
-      const message = err instanceof Error ? err.message : '';
-      const isUnauthorizedDomain = /unauthorized-domain/.test(message);
+      const code = (err as { code?: string })?.code ?? '';
 
-      const hostname = typeof window !== 'undefined' ? window.location.hostname : '';
-      const isLocal = hostname === 'localhost' || hostname === '127.0.0.1';
-      const origin = typeof window !== 'undefined' ? window.location.origin : '';
+      // Popup blocked or unsupported (mobile / strict browsers): fall back to
+      // the full-page redirect flow, which returns to this page afterwards.
+      if (
+        code === 'auth/popup-blocked' ||
+        code === 'auth/operation-not-supported-in-this-environment'
+      ) {
+        try {
+          await googleSignInRedirect();
+          return;
+        } catch (redirectErr) {
+          console.error('Redirect fallback failed:', redirectErr);
+          showSignInError(redirectErr);
+          return;
+        }
+      }
 
-      toast({
-        title: 'Sign-in failed',
-        description:
-          isUnauthorizedDomain
-            ? `Add "${hostname}" to your Firebase project’s Authorized domains (Authentication → Settings → Authorized domains), then reload and try again.`
-            : `Could not complete Google Sign-In. ${isLocal ? 'Check your popup settings.' : `If you're on Vercel/Netlify, also add "${origin}" to your Google Cloud Console OAuth client (Authorized JavaScript origins + redirect URIs).`}`,
-      });
+      showSignInError(err);
     } finally {
       setIsSigningIn(false);
     }
@@ -309,6 +407,19 @@ export function DriveSyncModal({
                       : 'Sign in with Google'}
                   </span>
                 </button>
+                {/* Full-page fallback link. Deliberately a plain <a> (not a
+                    Next.js Link/button) so the browser performs a real page
+                    load and the /?connect=drive flow starts cleanly. */}
+                <p className="text-xs text-zinc-500 text-center">
+                  Popup blocked?{' '}
+                  {/* eslint-disable-next-line @next/next/no-html-link-for-pages -- a full page load is required so the /?connect=drive effect runs */}
+                  <a
+                    href="/?connect=drive"
+                    className="underline underline-offset-2 hover:text-zinc-800 dark:hover:text-zinc-200"
+                  >
+                    Connect with the full-page link →
+                  </a>
+                </p>
               </div>
             )}
           </div>

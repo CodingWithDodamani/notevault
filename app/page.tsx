@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useSyncExternalStore } from 'react';
+import React, { useState, useEffect, useRef, useSyncExternalStore } from 'react';
 import { Navbar } from '@/components/Navbar';
 import { MobileNav } from '@/components/MobileNav';
 import { Dashboard } from '@/components/Dashboard';
@@ -11,12 +11,12 @@ import { SamsungNoteModal } from '@/components/SamsungNoteModal';
 import { FileDetailsModal } from '@/components/FileDetailsModal';
 import { GeminiStudyTutor } from '@/components/GeminiStudyTutor';
 import { ScienceScoutModal } from '@/components/ScienceScoutModal';
-import { DriveSyncModal } from '@/components/DriveSyncModal';
+import { DriveSyncModal, PendingDriveConnect } from '@/components/DriveSyncModal';
 import { GlobalSearchModal } from '@/components/GlobalSearchModal';
 import { SettingsModal, ThemePreference } from '@/components/SettingsModal';
 import { useVaultStore } from '@/lib/vault-store';
 import { VaultFile } from '@/lib/types';
-import { initAuth } from '@/lib/firebase';
+import { initAuth, completeGoogleRedirect, googleSignInRedirect } from '@/lib/firebase';
 import { restoreDriveSession } from '@/lib/drive-session';
 import { ToastProvider } from '@/lib/use-toast';
 import { Settings } from 'lucide-react';
@@ -133,6 +133,11 @@ export default function Home() {
   const [isScienceOpen, setIsScienceOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
+  // Direct-link Drive connect (/?connect=drive) result handed to the modal.
+  const [pendingConnect, setPendingConnect] = useState<PendingDriveConnect | null>(null);
+  const [pendingConnectError, setPendingConnectError] = useState<string | null>(null);
+  const connectFlowStartedRef = useRef(false);
+
   // Initialize Google Auth state listener
   useEffect(() => {
     const unsub = initAuth(
@@ -156,6 +161,74 @@ export default function Home() {
       if (typeof unsub === 'function') unsub();
     };
   }, [saveSyncInfo]);
+
+  // Direct-link Drive connect: visiting /?connect=drive starts a full-page
+  // Google sign-in; returning here afterwards completes the connection and
+  // reopens the sync modal. Ref-guarded so StrictMode's double mount runs it once.
+  useEffect(() => {
+    if (connectFlowStartedRef.current) return;
+    connectFlowStartedRef.current = true;
+
+    const stripConnectParam = () => {
+      const url = new URL(window.location.href);
+      if (!url.searchParams.has('connect')) return;
+      url.searchParams.delete('connect');
+      window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
+    };
+
+    const failWith = (err: unknown) => {
+      console.error('Direct-link Google sign-in failed:', err);
+      stripConnectParam();
+      const message = err instanceof Error ? err.message : '';
+      const hostname = window.location.hostname;
+      setPendingConnectError(
+        /unauthorized-domain/.test(message)
+          ? `Firebase blocks this domain. Add "${hostname}" under Firebase Console → Authentication → Settings → Authorized domains, then reopen the link.`
+          : message || 'Google sign-in was cancelled or failed.'
+      );
+      setIsSyncOpen(true);
+    };
+
+    void (async () => {
+      // 1) Finish a redirect that already came back from Google.
+      try {
+        const res = await completeGoogleRedirect();
+        if (res) {
+          stripConnectParam();
+          saveSyncInfo((prev) => ({
+            ...prev,
+            isConnected: true,
+            userEmail: res.user.email,
+            userName: res.user.displayName,
+            isSyncing: false,
+          }));
+          setPendingConnect({
+            accessToken: res.accessToken,
+            refreshToken: res.refreshToken,
+            email: res.user.email,
+            name: res.user.displayName,
+          });
+          setIsSyncOpen(true);
+          return;
+        }
+      } catch (err) {
+        failWith(err);
+        return;
+      }
+
+      // 2) Direct link with no pending result: start the redirect flow.
+      const wantsConnect =
+        new URLSearchParams(window.location.search).get('connect') === 'drive';
+      if (!wantsConnect) return;
+      try {
+        // Keep ?connect=drive in the URL — it is the return target for Google.
+        await googleSignInRedirect();
+      } catch (err) {
+        failWith(err);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Global Keyboard Shortcuts
   useEffect(() => {
@@ -405,6 +478,12 @@ export default function Home() {
         onUpdateSyncInfo={saveSyncInfo}
         onAddFiles={addDriveFiles}
         onClearVault={clearVault}
+        pendingConnect={pendingConnect}
+        pendingConnectError={pendingConnectError}
+        onPendingConnectHandled={() => {
+          setPendingConnect(null);
+          setPendingConnectError(null);
+        }}
       />
 
       <GlobalSearchModal
